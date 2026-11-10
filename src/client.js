@@ -24,6 +24,7 @@ window.__ModuleLoader__.load({
     const KINDS = ['prompt', 'memory', 'skill', 'subagent']
     const TABS = [
       ['overview', '概览'],
+      ['dream', 'AutoDream'],
       ['entries', '条目'],
       ['history', '精炼记录'],
       ['records', '进化记录'],
@@ -390,7 +391,7 @@ window.__ModuleLoader__.load({
           h('div', { className: 'evo-meta' },
             Object.entries(snapshot.files ?? {}).filter(([, info]) => info).map(([key, info]) => h(Badge, { key }, `${fileLabel(key)} ${fmtBytes(info.bytes)}`)),
             snapshot.lastActivity ? h(Badge, null, `最近 ${fmtTime(snapshot.lastActivity)}`) : null),
-          h('p', { className: 'evo-hint' }, '条目由模型工具或 /refine 命令写入；本面板只读展示，回滚请执行 /refine rollback <id> --global。')) : null,
+          h('p', { className: 'evo-hint' }, '精炼通过 AutoDream 或手动请求进入普通工单；技能验证通过后启用，人格提案由用户批准。历史版本恢复也需要生成候选并重新验证。')) : null,
         snapshot ? h('div', { className: 'evo-grid' },
           h(Card, { title: '最近精炼' }, h(HistoryList, { items: snapshot.recentHistory })),
           h(Card, { title: '最近复审' }, h(ReviewsList, { items: snapshot.recentReviews }))) : null)
@@ -482,7 +483,7 @@ window.__ModuleLoader__.load({
                   button('复制内容', () => { void copyText(detail.content ?? '', notify, '已复制条目内容') }, { kind: 'quiet' })))
                 : h('p', { className: 'evo-hint' }, '读取中…')) : null)
         })) : null,
-        h('p', { className: 'evo-hint' }, '回滚条目请执行 /refine rollback <id> --global；固定与归档由精炼计划携带，面板不直接改写状态文件。'))
+        h('p', { className: 'evo-hint' }, '恢复历史技能时，请在手动精炼请求中说明目标版本；恢复内容仍需通过候选、验证与版本冲突检查。'))
     }
 
     function HistoryTab({ refreshKey }) {
@@ -714,6 +715,116 @@ window.__ModuleLoader__.load({
               h('span', { className: 'evo-meta' }, `${fmtBytes(snapshot.bytes)} · ${fmtTime(snapshot.modifiedAt)}`)))))) : null)
     }
 
+    const DREAM_LABELS = {
+      submitted: '请求已提交', accepted: 'Ticket 已接纳', rejected: '已拒绝', deferred: '已延后', paused: '已暂停',
+      queued: '等待执行', running: '精炼中', completed: '精炼完成', failed: '失败', blocked: '验证受阻',
+      disabled: '自动精炼已关闭', cooldown: '冷却期内', insufficient_sessions: '新增会话不足',
+      insufficient_evidence: '新增一手证据不足', insufficient_primary_events: '新增一手证据不足',
+      eligible: '满足启动条件', read: '已读取', used: '已采用', no_durable_value: '无持久价值',
+      waiting_retry: '等待重试', published: '已发布', pending: '等待处理',
+      filtered: '策略已过滤', submitting: '正在提交 Input', planning: '综合材料中', planned: '候选已生成',
+      validating: '验证中', completed_rejected: '精炼完成，候选未通过',
+      request_pending: '已有请求等待处理', startup_failed: '启动检查失败',
+    }
+    const dreamLabel = value => DREAM_LABELS[value] || value || '—'
+
+    function DreamRun({ run }) {
+      return h('details', { className: 'evo-rec' },
+        h('summary', null, `${shortId(run.id, 16)} · ${dreamLabel(run.phase)} · ${fmtTime(run.createdAt)}`),
+        h('p', { className: 'evo-mono' }, `请求 ${run.requestId || '—'} · Ticket ${run.ticketId || '尚未接纳'}`),
+        h('p', { className: 'evo-hint' }, `完成时间：${fmtTime(run.completedAt)}`),
+        run.lastError ? h('p', { className: 'evo-text', role: 'alert' }, typeof run.lastError === 'string' ? run.lastError : JSON.stringify(run.lastError)) : null,
+        h('h3', { className: 'evo-card-subtitle' }, '证据覆盖与处置'),
+        run.coverage?.length ? h('div', { className: 'evo-list' }, run.coverage.map((item, index) => h('div', { key: index, className: 'evo-rec' },
+          h('span', null, typeof item === 'string' ? item : `${item.sessionId || item.ref || item.id || index + 1} · ${dreamLabel(item.disposition || item.status)}`),
+          h('pre', { className: 'evo-pre' }, JSON.stringify(item, null, 2))))) : h('p', { className: 'evo-hint' }, '尚无覆盖记录'),
+        h('h3', { className: 'evo-card-subtitle' }, '候选、验证与发布'),
+        run.candidates?.length ? h('div', { className: 'evo-list' }, run.candidates.map((candidate, index) => h('div', { key: candidate.id || index, className: 'evo-rec' },
+          h('strong', null, candidate.title || candidate.name || candidate.id || `候选 ${index + 1}`),
+          h('p', { className: 'evo-hint' }, `${candidate.kind || candidate.type || '—'} · ${dreamLabel(candidate.status)}`),
+          h('pre', { className: 'evo-pre' }, JSON.stringify(candidate, null, 2))))) : h('p', { className: 'evo-hint' }, '尚无候选；完成精炼也可能没有可发布变更。'),
+        h('details', null, h('summary', null, '完整运行记录（验证报告、版本与回滚引用）'), h('pre', { className: 'evo-pre' }, JSON.stringify(run, null, 2))))
+    }
+
+    function DreamTab({ refreshKey, settingsOnly = false }) {
+      const [data, setData] = useState(null)
+      const [draft, setDraft] = useState(null)
+      const [error, setError] = useState('')
+      const [saving, setSaving] = useState(false)
+      const [submitting, setSubmitting] = useState(false)
+      const [sessionId, setSessionId] = useState('')
+      const [crossSession, setCrossSession] = useState(false)
+      const [message, setMessage] = useState('')
+      const [refreshing, setRefreshing] = useState(false)
+      const load = useCallback(async (signal, updateDraft = true) => {
+        setRefreshing(true)
+        try {
+          const result = await request('/dream', undefined, signal)
+          if (!signal?.aborted) { setData(result); if (updateDraft) setDraft(clone(result.config)); setError('') }
+        } catch (failure) { if (!signal?.aborted) setError(failure.message) }
+        finally { if (!signal?.aborted) setRefreshing(false) }
+      }, [])
+      useEffect(() => {
+        const controller = new AbortController()
+        void load(controller.signal)
+        return () => controller.abort()
+      }, [load, refreshKey])
+      async function save() {
+        if (saving) return
+        if (['cooldownHours', 'minSessions', 'minPrimaryEvents'].some(key => !Number.isFinite(draft[key]) || draft[key] < 1 || !Number.isInteger(draft[key]))) {
+          setError('冷却时间、会话数和证据数必须为正整数'); return
+        }
+        setSaving(true); setError(''); setMessage('')
+        try {
+          await request('/dream/config', draft)
+          setMessage('AutoDream 设置已保存；自动检查在下次服务启动时执行。')
+          await load(undefined)
+        } catch (failure) { setError(failure.message) }
+        finally { setSaving(false) }
+      }
+      async function refine() {
+        if (submitting) return
+        if (!crossSession && !sessionId.trim()) { setError('请填写精炼会话 ID，或选择跨会话精炼'); return }
+        setSubmitting(true); setError(''); setMessage('')
+        try {
+          const result = await request('/dream/requests', { mode: 'manual', sessionId: sessionId.trim(), crossSession })
+          setMessage(`请求已提交：${result.request?.id || result.id || '等待策略评估'}；是否接纳以 Ticket 状态为准。`)
+          await load(undefined, false)
+        } catch (failure) { setError(failure.message) }
+        finally { setSubmitting(false) }
+      }
+      const configCard = draft ? h(Card, { title: 'AutoDream 设置' },
+        h('label', { className: 'evo-check' }, h('input', { type: 'checkbox', checked: draft.enabled === true, disabled: saving, onChange: event => setDraft(current => ({ ...current, enabled: event.target.checked })) }), '启动时自动检查精炼条件'),
+        h('div', { className: 'evo-row' }, [['cooldownHours', '冷却时间（小时）'], ['minSessions', '最少新增会话'], ['minPrimaryEvents', '最少新增一手证据']].map(([key, label]) => h(Field, { key, label },
+          h('input', { type: 'number', min: 1, step: 1, value: draft[key] ?? '', disabled: saving, onChange: event => setDraft(current => ({ ...current, [key]: event.target.value === '' ? '' : Number(event.target.value) })) })))),
+        h('p', { className: 'evo-hint' }, '默认 24 小时、5 个会话、10 条去重一手证据，三项同时满足。完成的自动或手动精炼（含无变更）重新开始冷却；失败不计。'),
+        button(saving ? '保存中…' : '保存 AutoDream 设置', save, { disabled: saving, kind: 'primary' })) : null
+      return h(React.Fragment, null,
+        h(Failure, { error, onRetry: () => { void load(undefined, !draft) } }),
+        message ? h('p', { className: 'evo-hint', role: 'status' }, message) : null,
+        !data && !error ? h('p', { className: 'evo-hint' }, '正在读取 AutoDream…') : null,
+        settingsOnly ? configCard : null,
+        data && !settingsOnly ? h(React.Fragment, null,
+          h(Card, { title: '启动检查', actions: button(refreshing ? '刷新中…' : '刷新运行状态', () => { void load(undefined, false) }, { disabled: refreshing }) },
+            h('p', null, `自动精炼：${data.config?.enabled ? '开启' : '关闭'} · ${dreamLabel(data.lastCheck?.reason)}`),
+            h('div', { className: 'evo-meta' }, h('span', null, `新增会话 ${data.lastCheck?.sessionCount ?? 0} / ${data.config?.minSessions ?? 5}`), h('span', null, `去重一手证据 ${data.lastCheck?.primaryEventCount ?? 0} / ${data.config?.minPrimaryEvents ?? 10}`)),
+            h('div', { className: 'evo-hint evo-col' },
+              h('span', null, `最近检查：${fmtTime(data.lastCheck?.at)}`), h('span', null, `最近尝试：${fmtTime(data.lastAttemptAt)}`),
+              h('span', null, `最近完成精炼：${fmtTime(data.lastCompletedAt)}`), h('span', null, `最近发布：${fmtTime(data.lastPublishedAt)}`))),
+          h(Card, { title: '手动精炼' },
+            h('div', { className: 'evo-row' }, h(Field, { label: '会话 ID' }, h('input', { type: 'text', 'aria-label': '精炼会话 ID', value: sessionId, disabled: submitting || crossSession, onChange: event => setSessionId(event.target.value) }))),
+            h('label', { className: 'evo-check' }, h('input', { type: 'checkbox', checked: crossSession, disabled: submitting, onChange: event => setCrossSession(event.target.checked) }), '综合本安装内同一主体的跨会话材料'),
+            h('p', { className: 'evo-hint' }, '手动精炼跳过自动时间和数量门槛，仍由普通 Input → 策略评估 → Ticket → 执行器处理。技能验证通过后自动启用，人格提案等待人工批准。'),
+            button(submitting ? '正在提交…' : '提交手动精炼', refine, { disabled: submitting, kind: 'primary' })),
+          h(Card, { title: '请求与接纳' },
+            data.requests?.length ? h('div', { className: 'evo-list' }, data.requests.map(item => h('details', { key: item.id, className: 'evo-rec' },
+              h('summary', null, `${item.id} · ${dreamLabel(item.status)} · ${fmtTime(item.createdAt)}`),
+              h('p', { className: 'evo-mono' }, `Input ${item.inputId || '尚未提交'} · Ticket ${item.ticketId || '尚未接纳'}`),
+              item.reason ? h('p', null, dreamLabel(item.reason)) : null,
+              h('pre', { className: 'evo-pre' }, JSON.stringify(item, null, 2))))) : h(Empty, null, '尚无精炼请求。满足门槛不代表已提交或已接纳。')),
+          h(Card, { title: '精炼运行' }, data.runs?.length ? h('div', { className: 'evo-list' }, data.runs.map(run => h(DreamRun, { key: run.id, run }))) : h(Empty, null, '尚无已开始的精炼运行。'))) : null)
+    }
+
     function SettingsTab({ refreshStatus, notify, refreshKey }) {
       const [config, setConfig] = useState(null)
       const [draft, setDraft] = useState(null)
@@ -909,12 +1020,13 @@ window.__ModuleLoader__.load({
       }, [refreshStatus])
       let content = null
       if (tab === 'overview') content = h(OverviewTab, { refreshKey, refreshStatus })
+      else if (tab === 'dream') content = h(DreamTab, { refreshKey })
       else if (tab === 'entries') content = h(EntriesTab, { refreshKey, notify })
       else if (tab === 'history') content = h(HistoryTab, { refreshKey })
       else if (tab === 'records') content = h(RecordsTab, { refreshKey })
       else if (tab === 'sessions') content = h(SessionsTab, { refreshKey, notify })
       else if (tab === 'benchmark') content = h(BenchmarkTab, { refreshKey })
-      else content = h(SettingsTab, { refreshStatus, notify, refreshKey })
+      else content = h(React.Fragment, null, h(DreamTab, { refreshKey, settingsOnly: true }), h(SettingsTab, { refreshStatus, notify, refreshKey }))
       const tabItems = TABS.map(([id, label]) => ({ id, label }))
       const onTabKeyDown = (event, index) => {
         if (event.key === 'Home' || event.key === 'End') {

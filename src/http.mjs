@@ -28,6 +28,7 @@ const DEFAULT_BODY_LIMIT = 256 * 1024
 
 /** Record store codes → HTTP status, so an operator sees the refusal the library meant. */
 const RECORD_STATUS = {
+  EVOLUTION_DREAM_REFUSED: 422,
   EVOLUTION_SQLITE_UNAVAILABLE: 503,
   EVOLUTION_STORE_UNAVAILABLE: 503,
   SUBJECT_UNAVAILABLE: 503,
@@ -209,7 +210,7 @@ async function overviewSnapshot(paths, recordStore) {
  * @param {import('@deepseek-ai/cordis').Context} ctx
  * @param {{ dshHome: string, store: object, publishOwner?: object }} options the store handle is lazy: nothing opens until a route needs it
  */
-export function registerEvolutionHttp(ctx, { dshHome, store, publishOwner }) {
+export function registerEvolutionHttp(ctx, { dshHome, store, publishOwner, dream }) {
   return ctx.webServer.register({
     kind: 'prefix',
     path: prefix,
@@ -237,6 +238,14 @@ export function registerEvolutionHttp(ctx, { dshHome, store, publishOwner }) {
       const query = url.searchParams
       try {
         const paths = () => resolveHarnessPaths(ctx, dshHome)
+
+        if (dream && route === '/dream' && req.method === 'GET') return send(res, 200, await dream.status())
+        if (dream && ['/dream/config', '/dream/requests', '/dream/refine'].includes(route) && req.method === 'POST') {
+          if (!requireJson(req, fail)) return
+          const body = await readBody(req)
+          // Browser callers can request manual refinement only; automatic admission is startup-owned.
+          return send(res, 200, route === '/dream/config' ? await dream.config(body.patch ?? body) : await dream.request({ ...body, mode: 'manual' }))
+        }
 
         if (route === '/status' && req.method === 'GET') {
           return send(res, 200, { ok: true, ...await statusSnapshot(paths()) })

@@ -6,9 +6,13 @@ import { registerComponentInternal } from '../../_shared/ipc.mjs'
  * Evolution has exactly one write entry point per record kind, and the store
  * stays lazy: registering the endpoint opens nothing.
  */
-export function registerEvolutionInternal(ctx, home, store) {
+export function registerEvolutionInternal(ctx, home, store, dream) {
   return registerComponentInternal(ctx, { home, name: 'evolution', handle: async ({ method, path, body }) => {
-    if (method === 'POST' && path === '/evidence') return store.recordEvidence(body ?? {})
+      if (dream && path.startsWith('/dream/')) {
+        const action = path.slice('/dream/'.length)
+        if (['status', 'config', 'request', 'authorize', 'claim', 'evidence', 'plan', 'execute', 'baseline'].includes(action)) return dream[action](body ?? {})
+      }
+      if (method === 'POST' && path === '/evidence') return store.recordEvidence(body ?? {})
     if (method === 'POST' && path === '/proposal') {
       return body?.proposalId ? store.advanceProposal(body) : store.upsertProposal(body ?? {})
     }

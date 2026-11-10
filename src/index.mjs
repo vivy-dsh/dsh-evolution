@@ -4,9 +4,10 @@ import { registerEvolutionHttp } from './http.mjs'
 import { registerEvolutionInternal } from './internal.mjs'
 import { createLazyEvolutionStore } from './records.mjs'
 import { callComponent } from '../../_shared/ipc.mjs'
+import { createDreamService, startDreamOnce } from './dream.mjs'
 
 export const name = 'dsh-evolution'
-export const inject = ['webServer', 'connection', 'configEditor']
+export const inject = ['webServer', 'connection', 'configEditor', 'workspaceRegistry', 'sessionPersistence', 'appReady']
 
 /**
  * Mount the evolution management API.
@@ -25,10 +26,12 @@ export function apply(ctx) {
     status: body => callComponent({ home: dshHome, name: 'mempalace', path: '/knowledge/status', body }),
     rollback: body => callComponent({ home: dshHome, name: 'mempalace', path: '/knowledge/rollback', body }),
   }
-  const disposeHttp = registerEvolutionHttp(ctx, { dshHome, store, publishOwner })
+  const dream = createDreamService({ home: dshHome, ctx })
+  startDreamOnce(ctx, dream)
+  const disposeHttp = registerEvolutionHttp(ctx, { dshHome, store, publishOwner, dream })
   // Cross-domain candidates arrive over the same loopback component channel the
   // console already publishes to; nothing here opens the database either.
-  const disposeInternal = registerEvolutionInternal(ctx, dshHome, store)
+  const disposeInternal = registerEvolutionInternal(ctx, dshHome, store, dream)
   ctx.effect(() => () => {
     disposeInternal()
     disposeHttp()
