@@ -21,9 +21,30 @@ window.__ModuleLoader__.load({
       return data
     }
 
+    // Skill candidates are staged by the owner and promoted only from its panel;
+    // this is the same-origin, session-authenticated review API.
+    const HARNESS_API = '/dsh-continual-harness/api'
+
+    async function harnessRequest(path, body, signal) {
+      const res = await fetch(`${HARNESS_API}${path}`, body === undefined ? { signal } : {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+        signal,
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok || data.ok === false) {
+        const error = new Error([data.error, data.hint].filter(Boolean).join('：') || `HTTP ${res.status}`)
+        error.code = data.code
+        throw error
+      }
+      return data
+    }
+
     const KINDS = ['prompt', 'memory', 'skill', 'subagent']
     const TABS = [
       ['overview', '概览'],
+      ['approval', '审批'],
       ['dream', 'AutoDream'],
       ['entries', '条目'],
       ['history', '精炼记录'],
@@ -717,13 +738,14 @@ window.__ModuleLoader__.load({
 
     const DREAM_LABELS = {
       submitted: '请求已提交', accepted: 'Ticket 已接纳', rejected: '已拒绝', deferred: '已延后', paused: '已暂停',
-      queued: '等待执行', running: '精炼中', completed: '精炼完成', failed: '失败', blocked: '验证受阻',
+      queued: '等待执行', running: '精炼中', completed: '精炼完成', failed: '失败', blocked: '受阻',
       disabled: '自动精炼已关闭', cooldown: '冷却期内', insufficient_sessions: '新增会话不足',
       insufficient_evidence: '新增一手证据不足', insufficient_primary_events: '新增一手证据不足',
       eligible: '满足启动条件', read: '已读取', used: '已采用', no_durable_value: '无持久价值',
       waiting_retry: '等待重试', published: '已发布', pending: '等待处理',
       filtered: '策略已过滤', submitting: '正在提交 Input', planning: '综合材料中', planned: '候选已生成',
-      validating: '验证中', completed_rejected: '精炼完成，候选未通过',
+      awaiting_review: '等待人工批准', pending_review: '等待人工批准', staged: '已暂存待审',
+      completed_rejected: '精炼完成，候选未获批准',
       request_pending: '已有请求等待处理', startup_failed: '启动检查失败',
     }
     const dreamLabel = value => DREAM_LABELS[value] || value || '—'
@@ -738,12 +760,75 @@ window.__ModuleLoader__.load({
         run.coverage?.length ? h('div', { className: 'evo-list' }, run.coverage.map((item, index) => h('div', { key: index, className: 'evo-rec' },
           h('span', null, typeof item === 'string' ? item : `${item.sessionId || item.ref || item.id || index + 1} · ${dreamLabel(item.disposition || item.status)}`),
           h('pre', { className: 'evo-pre' }, JSON.stringify(item, null, 2))))) : h('p', { className: 'evo-hint' }, '尚无覆盖记录'),
-        h('h3', { className: 'evo-card-subtitle' }, '候选、验证与发布'),
+        h('h3', { className: 'evo-card-subtitle' }, '候选与发布'),
         run.candidates?.length ? h('div', { className: 'evo-list' }, run.candidates.map((candidate, index) => h('div', { key: candidate.id || index, className: 'evo-rec' },
           h('strong', null, candidate.title || candidate.name || candidate.id || `候选 ${index + 1}`),
           h('p', { className: 'evo-hint' }, `${candidate.kind || candidate.type || '—'} · ${dreamLabel(candidate.status)}`),
           h('pre', { className: 'evo-pre' }, JSON.stringify(candidate, null, 2))))) : h('p', { className: 'evo-hint' }, '尚无候选；完成精炼也可能没有可发布变更。'),
         h('details', null, h('summary', null, '完整运行记录（验证报告、版本与回滚引用）'), h('pre', { className: 'evo-pre' }, JSON.stringify(run, null, 2))))
+    }
+
+    /**
+     * Human review surface. Staged skill candidates are read and decided here;
+     * nothing is published until someone confirms in this tab.
+     */
+    function ApprovalTab({ refreshKey }) {
+      const [items, setItems] = useState(null)
+      const [live, setLive] = useState([])
+      const [error, setError] = useState('')
+      const [busy, setBusy] = useState('')
+      const [message, setMessage] = useState('')
+      const load = useCallback(async signal => {
+        try {
+          const result = await harnessRequest('/pending', undefined, signal)
+          if (!signal?.aborted) {
+            setItems(Array.isArray(result.pending) ? result.pending : [])
+            setLive(Array.isArray(result.live) ? result.live : [])
+            setError('')
+          }
+        } catch (failure) { if (!signal?.aborted) setError(failure.message) }
+      }, [])
+      useEffect(() => {
+        const controller = new AbortController()
+        void load(controller.signal)
+        return () => controller.abort()
+      }, [load, refreshKey])
+      async function decide(item, decision) {
+        if (busy) return
+        setBusy(item.candidateId); setError(''); setMessage('')
+        try {
+          const result = await harnessRequest('/decide', { candidateId: item.candidateId, decision, expectedBundleDigest: item.bundleDigest, confirm: true })
+          setMessage(decision === 'approved'
+            ? `已批准并发布 ${item.skillId}${result.publication ? ` · v${result.publication.version}` : ''}`
+            : `已拒绝 ${item.skillId}`)
+          await load()
+        } catch (failure) { setError(failure.message) }
+        finally { setBusy('') }
+      }
+      const pendingCard = error
+        ? h(Card, { title: '待批技能候选', actions: button('重试', () => { void load() }, { kind: 'quiet' }) }, h('p', { className: 'evo-hint', role: 'alert' }, error))
+        : h(Card, { title: items === null ? '待批技能候选' : `待批技能候选（${items.length}）` },
+          h('p', { className: 'evo-hint' }, '技能正文会作为模型可见的说明书生效，发布后立即对所有会话可见。请先读完正文，再决定批准或拒绝。人格提案不在这里，见「人格 → 提案」。'),
+          items === null ? h('p', { className: 'evo-hint' }, '正在读取技能候选…')
+            : items.length === 0 ? h(Empty, null, '暂无待批技能候选。AutoDream 产出的技能候选会出现在这里，确认前不会发布。')
+            : h('div', { className: 'evo-list' }, items.map(item => h('div', { key: item.candidateId, className: 'evo-rec' },
+              h('div', { className: 'evo-row between' },
+                h('strong', null, item.skillId),
+                h('span', { className: 'evo-meta' }, fmtTime(item.stagedAt))),
+              h('p', { className: 'evo-mono' }, `候选 ${shortId(item.candidateId, 16)} · 摘要 ${shortId(item.bundleDigest, 12)} · 基线 ${item.baselineDigest ? shortId(item.baselineDigest, 12) : '新建'}`),
+              item.description ? h('p', null, item.description) : null,
+              item.files?.length ? h('p', { className: 'evo-hint' }, `附件：${item.files.join('、')}`) : null,
+              h('pre', { className: 'evo-pre' }, item.content),
+              h('div', { className: 'evo-row' },
+                button(busy === item.candidateId ? '处理中…' : '批准并发布', () => { void decide(item, 'approved') }, { disabled: Boolean(busy), kind: 'primary' }),
+                button('拒绝', () => { void decide(item, 'rejected') }, { disabled: Boolean(busy) }))))))
+      const liveCard = live.length ? h(Card, { title: '已发布的 harness 技能' },
+        h('div', { className: 'evo-list' }, live.map(item => h('div', { key: item.skillId, className: 'evo-rec' },
+          h('div', { className: 'evo-row between' }, h('strong', null, item.skillId), h('span', { className: 'evo-chip' }, `v${item.version}`)),
+          h('p', { className: 'evo-mono' }, `摘要 ${shortId(item.bundleDigest, 12)} · 决定 ${shortId(item.decisionDigest, 12)}`))))) : null
+      return h(React.Fragment, null,
+        message ? h('p', { className: 'evo-hint', role: 'status' }, message) : null,
+        pendingCard, liveCard)
     }
 
     function DreamTab({ refreshKey, settingsOnly = false }) {
@@ -814,7 +899,7 @@ window.__ModuleLoader__.load({
           h(Card, { title: '手动精炼' },
             h('div', { className: 'evo-row' }, h(Field, { label: '会话 ID' }, h('input', { type: 'text', 'aria-label': '精炼会话 ID', value: sessionId, disabled: submitting || crossSession, onChange: event => setSessionId(event.target.value) }))),
             h('label', { className: 'evo-check' }, h('input', { type: 'checkbox', checked: crossSession, disabled: submitting, onChange: event => setCrossSession(event.target.checked) }), '综合本安装内同一主体的跨会话材料'),
-            h('p', { className: 'evo-hint' }, '手动精炼跳过自动时间和数量门槛，仍由普通 Input → 策略评估 → Ticket → 执行器处理。技能验证通过后自动启用，人格提案等待人工批准。'),
+            h('p', { className: 'evo-hint' }, '手动精炼跳过自动时间和数量门槛，仍由普通 Input → 策略评估 → Ticket → 执行器处理。技能候选与人格提案都只在你确认后才生效。'),
             button(submitting ? '正在提交…' : '提交手动精炼', refine, { disabled: submitting, kind: 'primary' })),
           h(Card, { title: '请求与接纳' },
             data.requests?.length ? h('div', { className: 'evo-list' }, data.requests.map(item => h('details', { key: item.id, className: 'evo-rec' },
@@ -822,6 +907,7 @@ window.__ModuleLoader__.load({
               h('p', { className: 'evo-mono' }, `Input ${item.inputId || '尚未提交'} · Ticket ${item.ticketId || '尚未接纳'}`),
               item.reason ? h('p', null, dreamLabel(item.reason)) : null,
               h('pre', { className: 'evo-pre' }, JSON.stringify(item, null, 2))))) : h(Empty, null, '尚无精炼请求。满足门槛不代表已提交或已接纳。')),
+          h('p', { className: 'evo-hint' }, '本次精炼产生的技能候选在「审批」标签里等待确认；未确认前不会发布。'),
           h(Card, { title: '精炼运行' }, data.runs?.length ? h('div', { className: 'evo-list' }, data.runs.map(run => h(DreamRun, { key: run.id, run }))) : h(Empty, null, '尚无已开始的精炼运行。'))) : null)
     }
 
@@ -1020,6 +1106,7 @@ window.__ModuleLoader__.load({
       }, [refreshStatus])
       let content = null
       if (tab === 'overview') content = h(OverviewTab, { refreshKey, refreshStatus })
+      else if (tab === 'approval') content = h(ApprovalTab, { refreshKey })
       else if (tab === 'dream') content = h(DreamTab, { refreshKey })
       else if (tab === 'entries') content = h(EntriesTab, { refreshKey, notify })
       else if (tab === 'history') content = h(HistoryTab, { refreshKey })

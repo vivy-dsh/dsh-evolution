@@ -2,7 +2,6 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { mkdir, readFile, writeFile, rename, rm, open } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
-import { fileURLToPath } from 'node:url'
 import { resolveSubject } from '../../_shared/subject.mjs'
 import { callComponent } from '../../_shared/ipc.mjs'
 
@@ -142,7 +141,24 @@ export function createDreamService({ home, ctx, env = process.env, now = () => D
     return response.json()
   }
   const timestamp = () => new Date(now()).toISOString()
-  async function status() { return { ok: true, subjectId: (await ready(), subjectId), ...await journal.read() } }
+  async function status() {
+    await ready()
+    const state = await journal.read()
+    // The journal records the request; the owner records what a human approved.
+    // Merge the live publications so a run stops looking unresolved once the
+    // panel has promoted its candidate.
+    let publications = []
+    try { const live = await owner('harness', '/status', {}); publications = Array.isArray(live) ? live : [] } catch { publications = [] }
+    const runs = state.runs.map(run => ({
+      ...run,
+      candidates: (run.candidates ?? []).map(candidate => {
+        const published = candidate.ownerRef?.skillId ? publications.find(item => item.skillId === candidate.ownerRef.skillId) : undefined
+        if (!published || published.bundleDigest !== candidate.ownerRef?.bundleDigest) return candidate
+        return { ...candidate, status: 'published', publication: { publicationId: published.publicationId, version: published.version, decisionDigest: published.decisionDigest } }
+      }),
+    }))
+    return { ok: true, subjectId, ...state, runs }
+  }
   async function config(patch) {
     await ready()
     return journal.update(state => {
@@ -180,8 +196,7 @@ export function createDreamService({ home, ctx, env = process.env, now = () => D
       return item
     })
     if (created.skipped || created.status === 'submitted') return created
-    const script = fileURLToPath(new URL('../../../scripts/dream-refine.mjs', import.meta.url))
-    const text = `Use the diva-dream skill. Refine source evidence request ${created.id}. Execute the normal domain CLI with your current Ticket ID: node ${JSON.stringify(script)} claim --request ${created.id} --ticket <your-ticket-id>. Read its frozen snapshot, create per-session fact cards with immutable refs, then cross-session synthesis. Submit a plan before execution. Persona changes create user-review proposals; skill changes require independent real validation and owner publication. Report blocked infrastructure honestly. No self-evolution outside this request.${instructions ? `\nUser refine focus (does not change publication authority): ${instructions}` : ''}`
+    const text = `Use the diva-dream skill. Refine source evidence request ${created.id}. This Ticket's Session has no shell or file tools: drive the run with the dream_refine tool (claim, evidence, baseline, plan, execute, status). Read the frozen material in pages, create per-session fact cards with immutable refs, synthesize across sessions, then submit the plan with dream_refine plan. Persona changes create user-review proposals; skill changes become owner candidates that a human approves in the panel. Report blocked infrastructure honestly. No self-evolution outside this request.${instructions ? `\nUser refine focus (does not change publication authority): ${instructions}` : ''}`
     const receipt = await api('inputs', { subjectId, sourceId: 'local', externalEventId: created.id, dedupeKey: created.id, layer: 'evolution', human: mode === 'manual', payload: { text }, provenance: { actor: mode === 'automatic' ? 'autodream' : 'manual-refine', note: `Frozen source snapshot ${created.snapshotDigest}` } })
     return journal.update(state => {
       const item = state.requests.find(item => item.id === created.id)
@@ -189,7 +204,7 @@ export function createDreamService({ home, ctx, env = process.env, now = () => D
       return item
     })
   }
-  async function authorize({ ticketId, subjectId: requestedSubject, requestId, scope, skillId, entryDigest, expectedDigest, evidenceRefs, candidateId, bundleDigest, filesDigest, expectedBaseRevision, expectedDraftDigest, evidenceIds, summary } = {}) {
+  async function authorize({ ticketId, subjectId: requestedSubject, requestId, scope, skillId, entryDigest, expectedDigest, evidenceRefs, filesDigest, expectedBaseRevision, expectedDraftDigest, evidenceIds, summary } = {}) {
     await ready()
     if (requestedSubject && requestedSubject !== subjectId) refuse('Dream subject mismatch')
     if (!ticketId || !/^[a-zA-Z0-9_-]+$/.test(ticketId)) refuse('Ticket ID required')
@@ -203,15 +218,14 @@ export function createDreamService({ home, ctx, env = process.env, now = () => D
     if (!item || ticket.paused || !assignment || assignment.state !== 'running' || ticket.state !== 'open' || ticket.ended || !ticket.mandate?.scope || !ticket.mandate?.policyVersion) refuse('No live Ticket mandate/assignment owns this Dream Input')
     const run = state.runs.find(run => run.requestId === item.id)
     if (run && run.ticketId !== ticketId) refuse('Dream request already belongs to another Ticket')
-    if (scope?.startsWith('skill:')) {
+    if (scope === 'skill:stage') {
       const index = run?.plan?.candidates.findIndex(candidate => candidate.kind === 'skill' && candidate.skillId === skillId && candidate.entryDigest === entryDigest && candidate.expectedDigest === expectedDigest)
       if (index === undefined || index < 0) refuse('Exact skill entry absent from frozen Dream plan')
       const plannedRefs = run.plan.candidates[index].refs.map(id => item.snapshot.refs.find(ref => ref.id === id))
       const canonicalRefs = refs => assetDigest([...refs].sort((a, b) => String(a?.id).localeCompare(String(b?.id))))
       if (!Array.isArray(evidenceRefs) || canonicalRefs(evidenceRefs) !== canonicalRefs(plannedRefs)) refuse('Skill evidence provenance does not match frozen source references')
-      if (scope === 'skill:publish' && (run.candidates[index]?.ownerCandidateId !== candidateId || run.candidates[index]?.ownerRef?.bundleDigest !== bundleDigest)) refuse('Skill publication does not match staged owner candidate')
       if (terminal(run)) refuse('Dream run already settled')
-    }
+    } else if (scope?.startsWith('skill:')) refuse('Skill publication is decided by a human in the owner panel, not by this Ticket')
     if (scope === 'persona:stage') {
       const exact = run?.plan?.candidates.some(candidate => candidate.kind === 'persona' && candidate.filesDigest === filesDigest && candidate.expectedBaseRevision === expectedBaseRevision && candidate.expectedDraftDigest === expectedDraftDigest && candidate.summaryDigest === hash(summary ?? '') && hash([...new Set(candidate.refs)].sort()) === hash([...new Set(evidenceIds ?? [])].sort()))
       if (!exact || terminal(run)) refuse('Exact persona candidate absent from active frozen Dream plan')
@@ -305,7 +319,7 @@ export function createDreamService({ home, ctx, env = process.env, now = () => D
     let state = await journal.read(), run = state.runs.find(run => run.requestId === auth.requestId)
     if (!run?.plan) refuse('Frozen plan required before execute')
     if (terminal(run)) return run
-    await updateRun(run.id, r => { r.phase = 'validating' })
+    await updateRun(run.id, r => { r.phase = 'awaiting_review' })
     for (let index = 0; index < run.plan.candidates.length; index++) {
       const candidate = run.plan.candidates[index], key = `${run.id}:${index}`
       let current = (await journal.read()).runs.find(r => r.id === run.id).candidates[index]
@@ -315,32 +329,10 @@ export function createDreamService({ home, ctx, env = process.env, now = () => D
         current ??= { kind: candidate.kind, refs: candidate.refs, status: 'staging', idempotencyKey: key }
         await updateRun(run.id, r => { r.candidates[index] = current })
         if (!current.ownerCandidateId) refuse('Candidate staging incomplete; retry the frozen plan')
-        if (candidate.kind === 'persona') current.status = 'pending_review'
-        else {
-          const checkPublication = receipt => {
-            if (!receipt || receipt.skillId !== candidate.skillId || receipt.candidateId !== current.ownerCandidateId || receipt.bundleDigest !== current.ownerRef.bundleDigest || receipt.baselineDigest !== current.ownerRef.baselineDigest || receipt.receiptId !== current.publishIntent.receiptId || receipt.idempotencyKey !== current.publishIntent.idempotencyKey) refuse('Owner publication receipt does not match frozen intent')
-            return Object.fromEntries(['skillId', 'candidateId', 'publicationId', 'version', 'bundleDigest', 'baselineDigest', 'receiptId', 'idempotencyKey'].map(key => [key, receipt[key]]))
-          }
-          // Unknown outcomes must reconcile BEFORE validation: the baseline may already have advanced.
-          const reconciled = current.publishIntent ? await owner('harness', '/status', { idempotencyKey: current.publishIntent.idempotencyKey }) : null
-          if (reconciled) { current.publication = checkPublication(reconciled); current.status = 'published' }
-          else {
-          const validation = await owner('harness', '/validate', { candidateId: current.ownerCandidateId })
-          current.validation = Object.fromEntries(['candidateId', 'status', 'receiptId', 'reason', 'bundleDigest', 'baselineDigest', 'testSuiteDigest', 'runnerEnvironmentDigest', 'policyVersion'].filter(key => validation[key] !== undefined).map(key => [key, validation[key]]))
-          if (current.validation.status === 'rejected') current.status = 'rejected'
-          else if (current.validation.status !== 'passed') { current.status = 'blocked'; current.error = current.validation.reason ?? 'Validation incomplete' }
-          else {
-            // Persist intent BEFORE owner write. Its idempotency key/status reconciles a lost reply.
-            current.status = 'publishing'; current.publishIntent = { idempotencyKey: `${key}:publish`, receiptId: current.validation.receiptId }
-            await updateRun(run.id, r => { r.candidates[index] = current })
-            await authorize(body)
-            current.publication = checkPublication(await owner('harness', '/publish', { candidateId: current.ownerCandidateId, ...current.publishIntent, ticketId: run.ticketId, subjectId }))
-            current.status = 'published'
-          }
-          }
-        }
+        // Both kinds stop here: person changes and skill changes alike wait for
+        // the human decision in its owner panel. Nothing is applied on this path.
+        current.status = 'pending_review'
         delete current.error
-        if (current.status === 'blocked') current.error = current.validation?.reason ?? 'Validation incomplete'
       } catch (error) { current = { ...current, kind: candidate.kind, refs: candidate.refs, status: 'blocked', error: String(error.message ?? error) } }
       await updateRun(run.id, (r, s) => {
         r.candidates[index] = current

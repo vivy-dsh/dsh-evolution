@@ -5,9 +5,10 @@ import { registerEvolutionInternal } from './internal.mjs'
 import { createLazyEvolutionStore } from './records.mjs'
 import { callComponent } from '../../_shared/ipc.mjs'
 import { createDreamService, startDreamOnce } from './dream.mjs'
+import { registerDreamTool } from './dream-tool.mjs'
 
 export const name = 'dsh-evolution'
-export const inject = ['webServer', 'connection', 'configEditor', 'workspaceRegistry', 'sessionPersistence', 'appReady']
+export const inject = ['webServer', 'connection', 'configEditor', 'workspaceRegistry', 'sessionPersistence', 'appReady', 'tools']
 
 /**
  * Mount the evolution management API.
@@ -28,6 +29,8 @@ export function apply(ctx) {
   }
   const dream = createDreamService({ home: dshHome, ctx })
   startDreamOnce(ctx, dream)
+  // The Dream executor's only tool: it reads frozen material and submits a plan, nothing else.
+  registerDreamTool(ctx, { dream })
   const disposeHttp = registerEvolutionHttp(ctx, { dshHome, store, publishOwner, dream })
   // Cross-domain candidates arrive over the same loopback component channel the
   // console already publishes to; nothing here opens the database either.

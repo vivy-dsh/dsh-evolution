@@ -87,7 +87,7 @@ test('startup submits a nonhuman ordinary Input with normal shell CLI and no dir
   assert.equal(request.status, 'submitted')
   assert.equal(f.submitted[0].human, false)
   assert.equal(f.submitted[0].layer, 'evolution')
-  assert.match(f.submitted[0].payload.text, /dream-refine\.mjs/)
+  assert.match(f.submitted[0].payload.text, /dream_refine tool/)
   await f.service.startup()
   assert.equal(f.submitted.length, 1)
   assert.equal((await f.service.status()).lastCompletedAt, undefined)
@@ -123,39 +123,46 @@ test('analyzed no-op completion consumes covered facts and prevents terminal pla
   assert.equal((await f.service.startup()).reason, 'cooldown')
 })
 
-test('owner staging holds candidate bodies; blocked validation does not consume or start cooldown; retry publishes once', async t => {
-  let passed = false, published = 0, staged = 0
+test('owner staging holds candidate bodies; completion leaves the candidate for human review and never publishes', async t => {
+  let staged = 0, calls = []
   const f = await fixture(t, { owner: async (name, path, body) => {
+    calls.push(path)
     if (path === '/candidates') { staged++; return { candidateId: 'c1', bundleDigest: 'bundle', baselineDigest: null, entry: { content: 'SECRET-OWNER-BODY' } } }
-    if (path === '/validate') return passed ? { status: 'passed', receiptId: 'receipt' } : { status: 'blocked', reason: 'OCI unavailable' }
-    if (path === '/status') return null
-    if (path === '/publish') { published++; return { publicationId: 'pub1', skillId: 'test-skill', candidateId: 'c1', bundleDigest: 'bundle', baselineDigest: null, receiptId: body.receiptId, idempotencyKey: body.idempotencyKey } }
+    return {}
   } })
   const { body, plan } = await planned(f, [{ kind: 'skill', skillId: 'test-skill', expectedDigest: null, entry: { content: 'SECRET-OWNER-BODY' } }])
   const manifest = await readFile(join(f.home, 'evolution', 'dream', subjectId, 'manifest.json'), 'utf8')
   assert.equal(manifest.includes('SECRET-OWNER-BODY'), false)
-  assert.equal((await f.service.execute(body)).phase, 'blocked')
-  assert.equal((await f.service.status()).lastCompletedAt, undefined)
-  assert.equal((await f.service.status()).consumed.length, 0)
-  passed = true
+  const result = await f.service.execute(body)
+  // Nothing is validated or published on this path; the run only hands control to the panel.
+  assert.equal(result.phase, 'completed')
+  assert.equal(result.candidates[0].status, 'pending_review')
+  assert.equal(calls.filter(path => path === '/validate' || path === '/publish').length, 0)
+  assert.equal(staged, 1)
   const [a, b] = await Promise.all([f.service.execute(body), f.service.execute(body)])
   assert.equal(a.phase, 'completed'); assert.equal(b.phase, 'completed')
-  assert.equal(staged, 1); assert.equal(published, 1)
+  assert.equal(staged, 1)
   await assert.rejects(f.service.authorize({ ...body, subjectId, scope: 'skill:stage', skillId: 'test-skill', entryDigest: hash(plan.candidates[0].entry) }), /settled|absent/)
 })
 
-test('lost publication reply reconciles committed receipt before baseline revalidation', async t => {
-  let published, validations = 0
+test('a skill publication recorded by the owner panel shows up on the run without touching the journal', async t => {
   const f = await fixture(t, { owner: async (name, path, body) => {
-    if (path === '/candidates') return { candidateId: 'c1', bundleDigest: 'bundle', baselineDigest: null }
-    if (path === '/validate') { validations++; if (published) throw new Error('baseline advanced'); return { status: 'passed', receiptId: 'r1' } }
-    if (path === '/status') return published ?? null
-    if (path === '/publish') { published = { skillId: 'test-skill', candidateId: 'c1', bundleDigest: 'bundle', baselineDigest: null, publicationId: 'pub1', receiptId: body.receiptId, idempotencyKey: body.idempotencyKey }; throw new Error('connection lost after commit') }
+    if (path === '/candidates') return { candidateId: 'c1', skillId: 'test-skill', bundleDigest: 'bundle', baselineDigest: null }
+    if (path === '/status' && body?.idempotencyKey === undefined) return []
+    return {}
   } })
   const { body } = await planned(f, [{ kind: 'skill', skillId: 'test-skill', expectedDigest: null, entry: { content: 'instructions' } }])
-  assert.equal((await f.service.execute(body)).phase, 'blocked')
-  assert.equal((await f.service.execute(body)).phase, 'completed')
-  assert.equal(validations, 1)
+  await f.service.execute(body)
+  const before = await f.service.status()
+  assert.equal(before.runs[0].candidates[0].status, 'pending_review')
+  assert.equal(before.runs[0].candidates[0].publication, undefined)
+  // The human approved it in the panel: the owner now reports it live.
+  const live = await fixture(t, { owner: async (name, path) => path === '/status' ? [{ skillId: 'test-skill', bundleDigest: 'bundle', publicationId: 'pub1', version: 1, decisionDigest: 'd1' }] : { candidateId: 'c1', skillId: 'test-skill', bundleDigest: 'bundle', baselineDigest: null } })
+  const published = await planned(live, [{ kind: 'skill', skillId: 'test-skill', expectedDigest: null, entry: { content: 'instructions' } }])
+  await live.service.execute(published.body)
+  const after = await live.service.status()
+  assert.equal(after.runs[0].candidates[0].status, 'published')
+  assert.deepEqual(after.runs[0].candidates[0].publication, { publicationId: 'pub1', version: 1, decisionDigest: 'd1' })
 })
 
 test('exact skill entry digest and staged owner candidate bind authorization; journal excludes arbitrary model fields', async t => {
@@ -168,14 +175,14 @@ test('exact skill entry digest and staged owner candidate bind authorization; jo
   await assert.rejects(f.service.authorize({ ...skillAuth, evidenceRefs: [{ ...skillAuth.evidenceRefs[0], digest: 'forged' }, ...skillAuth.evidenceRefs.slice(1)] }), /provenance/)
   await assert.rejects(f.service.authorize({ ...skillAuth, evidenceRefs: skillAuth.evidenceRefs.map(ref => ({ ...ref, workspace: '/forged' })) }), /provenance/)
   await assert.rejects(f.service.authorize({ ...body, scope: 'skill:stage', skillId: 'test-skill', entryDigest: 'forged' }), /Exact skill/)
-  await assert.rejects(f.service.authorize({ ...skillAuth, scope: 'skill:publish', candidateId: 'other', bundleDigest: 'bundle' }), /staged owner/)
+  await assert.rejects(f.service.authorize({ ...skillAuth, scope: 'skill:publish', candidateId: 'other', bundleDigest: 'bundle' }), /human in the owner panel/)
   const manifest = await readFile(join(f.home, 'evolution', 'dream', subjectId, 'manifest.json'), 'utf8')
   assert.equal(manifest.includes('OWNER-SECRET'), false); assert.equal(manifest.includes('ARBITRARY-SECRET'), false)
   assert.ok(plan.candidates.length)
 })
 
-test('partial persona proposal settles only its evidence while blocked skills retain unresolved coverage', async t => {
-  const f = await fixture(t, { owner: async (name, path) => path.includes('candidates') ? { candidateId: name } : { status: 'blocked', reason: 'runner missing' } })
+test('persona and skill candidates both settle into review without any owner publication call', async t => {
+  const f = await fixture(t, { owner: async (name, path) => path.includes('candidates') ? { candidateId: `${name}-candidate`, bundleDigest: 'bundle', baselineDigest: null } : [] })
   const request = await f.service.startup(), body = { requestId: request.id, ticketId: 'ticket-1' }
   await f.service.claim(body); const evidence = await f.service.evidence(body)
   const refs = evidence.sessions.flatMap(s => s.facts.map(fact => fact.ref.id))
@@ -186,9 +193,12 @@ test('partial persona proposal settles only its evidence while blocked skills re
   const personaAuth = { ...body, subjectId, scope: 'persona:stage', filesDigest: hash({ 'SOUL.md': 'insight' }), expectedBaseRevision: 0, expectedDraftDigest: 'digest', summary: 'Source-grounded insight', evidenceIds: refs.slice(0, 2) }
   assert.equal((await f.service.authorize(personaAuth)).authorized, true)
   await assert.rejects(f.service.authorize({ ...personaAuth, expectedDraftDigest: 'other' }), /Exact persona/)
-  assert.equal((await f.service.execute(body)).phase, 'blocked')
+  const result = await f.service.execute(body)
+  assert.equal(result.phase, 'completed')
+  assert.deepEqual(result.candidates.map(candidate => candidate.status), ['pending_review', 'pending_review'])
   const status = await f.service.status()
-  assert.equal(status.consumed.length, 2); assert.equal(status.lastCompletedAt, undefined)
+  assert.equal(status.consumed.length, refs.length)
+  assert.ok(status.lastCompletedAt)
 })
 
 test('manifest serializes concurrent writes and survives reopening', async t => {
