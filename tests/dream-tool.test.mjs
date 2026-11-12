@@ -26,7 +26,7 @@ function fixture() {
   const dream = {
     claim: async body => { calls.push(['claim', body]); return { run: { id: 'run_1', phase: 'planning', candidates: [] }, request: { id: 'dream_1', mode: 'manual', snapshotDigest: 'a'.repeat(64), snapshot: { sessions: [{ sessionId: 'session-a', upperBound: 3 }, { sessionId: 'session-b', upperBound: 1 }], refs: [1, 2, 3, 4] } } } },
     evidence: async body => { calls.push(['evidence', body]); return material() },
-    baseline: async body => { calls.push(['baseline', body]); return { persona: { revision: 3, digest: 'b'.repeat(64) }, skills: { skills: [{ skillId: 'diva-dream', bundleDigest: 'c'.repeat(64), provider: 'skill' }] } } },
+    baseline: async body => { calls.push(['baseline', body]); return { persona: { revision: 3, digest: 'b'.repeat(64), draftDigest: 'd'.repeat(64) }, skills: { skills: [{ skillId: 'diva-dream', bundleDigest: 'c'.repeat(64), provider: 'skill' }] } } },
     plan: async body => { calls.push(['plan', body]); return { id: 'run_1', phase: 'planned', plan: { factCards: [1], coverage: [1, 2], candidates: [{ kind: 'persona' }] }, candidates: [{ kind: 'persona', status: 'staged' }] } },
     execute: async body => { calls.push(['execute', body]); return { id: 'run_1', phase: 'completed', candidates: [{ kind: 'persona', status: 'pending_review' }] } },
     status: async () => ({ runs: [{ id: 'run_1', requestId: 'dream_1', ticketId: 't1', phase: 'planned', candidates: [] }, { id: 'run_2', requestId: 'dream_2', ticketId: 't2', phase: 'done', candidates: [] }] }),
@@ -84,6 +84,7 @@ test('dream_refine reads the baseline, submits a plan and stages nothing on its 
   await tool.execute({ command: 'claim' }, worker('t1'))
   const baseline = await tool.execute({ command: 'baseline' }, worker('t1'))
   assert.equal(baseline.persona.revision, 3)
+  assert.equal(baseline.persona.draftDigest, 'd'.repeat(64))
   assert.deepEqual(baseline.skills, [{ id: 'diva-dream', digest: 'c'.repeat(64), provider: 'skill' }])
   await assert.rejects(tool.execute({ command: 'plan' }, worker('t1')), /plan object/)
   const plan = { coverage: ['event:1'], candidates: [], factCards: [] }

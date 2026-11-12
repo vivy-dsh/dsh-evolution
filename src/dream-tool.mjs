@@ -140,10 +140,16 @@ export function registerDreamTool(ctx, { dream }) {
         }
         case 'baseline': {
           const value = await dream.baseline(base)
-          const skills = Object.values(value?.skills?.skills ?? value?.skills?.entries ?? {}).flat()
+          // The harness owner reports a publication list; older/other owners wrap it.
+          const listed = Array.isArray(value?.skills) ? value.skills : Object.values(value?.skills?.skills ?? value?.skills?.entries ?? {}).flat()
           return {
-            persona: value?.persona ? { revision: value.persona.revision ?? value.persona.baseRevision ?? null, digest: value.persona.digest ?? value.persona.liveDigest ?? null } : null,
-            skills: Array.isArray(skills) ? skills.map(skill => ({ id: skill?.id ?? skill?.skillId, digest: skill?.digest ?? skill?.bundleDigest ?? null, provider: skill?.provider ?? null })) : [],
+            persona: value?.persona ? {
+              revision: value.persona.revision ?? value.persona.baseRevision ?? null,
+              digest: value.persona.digest ?? value.persona.liveDigest ?? null,
+              // Persona candidates must cite this exact draft digest, so it may not be dropped.
+              draftDigest: value.persona.draftDigest ?? null,
+            } : null,
+            skills: listed.map(skill => ({ id: skill?.id ?? skill?.skillId ?? null, digest: skill?.digest ?? skill?.bundleDigest ?? null, provider: skill?.provider ?? null })),
           }
         }
         case 'plan': {

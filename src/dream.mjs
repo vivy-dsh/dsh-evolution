@@ -300,9 +300,12 @@ export function createDreamService({ home, ctx, env = process.env, now = () => D
       if (prior?.ownerCandidateId) continue
       await authorize(body)
       try {
+        // The owner re-authorizes against Evolution. Without the bound request id that
+        // lookup falls back to "the first request this Ticket owns", so a Ticket with
+        // an older Dream Input would authorize the wrong run and refuse this plan.
         const staged = candidate.kind === 'skill'
-          ? await owner('harness', '/candidates', { ...candidate, subjectId, ticketId: frozen.ticketId, evidenceRefs: candidate.refs.map(id => item.snapshot.refs.find(ref => ref.id === id)), idempotencyKey: key })
-          : await owner('laputa', '/candidates/stage', { ...candidate, subjectId, ticketId: frozen.ticketId, evidenceIds: candidate.refs, idempotencyKey: key })
+          ? await owner('harness', '/candidates', { ...candidate, subjectId, ticketId: frozen.ticketId, requestId: auth.requestId, evidenceRefs: candidate.refs.map(id => item.snapshot.refs.find(ref => ref.id === id)), idempotencyKey: key })
+          : await owner('laputa', '/candidates/stage', { ...candidate, subjectId, ticketId: frozen.ticketId, requestId: auth.requestId, evidenceIds: candidate.refs, idempotencyKey: key })
         if (!staged?.candidateId) refuse('Owner did not return a candidate receipt')
         const ownerRef = Object.fromEntries(['candidateId', 'skillId', 'bundleDigest', 'baselineDigest', 'candidateDigest', 'personaId', 'baseRevision', 'status'].filter(key => staged[key] !== undefined).map(key => [key, staged[key]]))
         await updateRun(frozen.id, run => { run.candidates[index] = { kind: candidate.kind, refs: candidate.refs, status: 'staged', idempotencyKey: key, ownerCandidateId: staged.candidateId, ownerRef } })
@@ -351,7 +354,9 @@ export function createDreamService({ home, ctx, env = process.env, now = () => D
   }
   return { status, config, request, authorize, claim, evidence,
     plan: body => serialized(body.requestId, () => plan(body)), execute: body => serialized(body.requestId, () => execute(body)),
-    baseline: async body => { await authorize(body); return { persona: await owner('laputa', '/baseline'), skills: await owner('harness', '/status', {}) } },
+    // An empty body keeps this a POST: the Laputa internal channel only serves POST,
+    // and a body-less callComponent would arrive as GET and be refused as unknown.
+    baseline: async body => { await authorize(body); return { persona: await owner('laputa', '/baseline', {}), skills: await owner('harness', '/status', {}) } },
     startup: async () => {
       try { return await request({ mode: 'automatic', crossSession: true }) }
       catch (error) {

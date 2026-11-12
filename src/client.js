@@ -593,7 +593,7 @@ window.__ModuleLoader__.load({
                 h('option', { value: '' }, '全部'),
                 RECORD_GROUPS.map(([, label, value]) => h('option', { key: value, value }, label)))),
             button('读取', () => setQuery(ticketId.trim()), { kind: 'primary' })),
-          h('p', { className: 'evo-hint' }, '记录按 Superagent 的 Ticket 归组，只读；提案与发布的版本历史来自 /proposal 与 /publication。')),
+          h('p', { className: 'evo-hint' }, '记录按 Superagent 的 Ticket 归组，只读；提案与发布的版本历史来自 /proposal 与 /publication。当前没有运行时生产者写入记录库：技能审批记录在「审批」页的「已处置」，人格提案记录在「人格 → 提案」。')),
         data ? h(Card, { title: `工单 ${data.ticketId}`, actions: button('清除', () => { setTicketId(''); setQuery('') }, { kind: 'quiet' }) },
           total === 0 ? h(Empty, null, '该工单没有进化记录。') : null,
           RECORD_GROUPS.filter(([key]) => data[key]?.length).map(([key, label, value]) =>
@@ -768,21 +768,43 @@ window.__ModuleLoader__.load({
         h('details', null, h('summary', null, '完整运行记录（验证报告、版本与回滚引用）'), h('pre', { className: 'evo-pre' }, JSON.stringify(run, null, 2))))
     }
 
+    /** Line-level review diff: trim the common head/tail, cap the changed block. */
+    function diffBundles(bundle, baseline) {
+      const base = new Map((baseline ?? []).map(file => [file.name, file.content]))
+      const next = new Map((bundle ?? []).map(file => [file.name, file.content]))
+      return [...new Set([...base.keys(), ...next.keys()])]
+        .filter(name => (base.get(name) ?? '') !== (next.get(name) ?? ''))
+        .map(name => {
+          const left = (base.get(name) ?? '').split('\n'), right = (next.get(name) ?? '').split('\n')
+          let start = 0
+          while (start < left.length && start < right.length && left[start] === right[start]) start += 1
+          let endLeft = left.length, endRight = right.length
+          while (endLeft > start && endRight > start && left[endLeft - 1] === right[endRight - 1]) { endLeft -= 1; endRight -= 1 }
+          const limit = 300, lines = []
+          for (let index = 0; index < Math.min(endLeft - start, limit); index += 1) lines.push({ kind: 'remove', text: left[start + index] })
+          for (let index = 0; index < Math.min(endRight - start, Math.max(0, limit - lines.length)); index += 1) lines.push({ kind: 'add', text: right[start + index] })
+          return { name, lines, omitted: (endLeft - start) + (endRight - start) - lines.length }
+        })
+    }
+
     /**
      * Human review surface. Staged skill candidates are read and decided here;
      * nothing is published until someone confirms in this tab.
      */
     function ApprovalTab({ refreshKey }) {
       const [items, setItems] = useState(null)
+      const [decided, setDecided] = useState([])
       const [live, setLive] = useState([])
       const [error, setError] = useState('')
       const [busy, setBusy] = useState('')
       const [message, setMessage] = useState('')
+      const [rollbackOf, setRollbackOf] = useState('')
       const load = useCallback(async signal => {
         try {
           const result = await harnessRequest('/pending', undefined, signal)
           if (!signal?.aborted) {
             setItems(Array.isArray(result.pending) ? result.pending : [])
+            setDecided(Array.isArray(result.decided) ? result.decided : [])
             setLive(Array.isArray(result.live) ? result.live : [])
             setError('')
           }
@@ -799,8 +821,18 @@ window.__ModuleLoader__.load({
         try {
           const result = await harnessRequest('/decide', { candidateId: item.candidateId, decision, expectedBundleDigest: item.bundleDigest, confirm: true })
           setMessage(decision === 'approved'
-            ? `已批准并发布 ${item.skillId}${result.publication ? ` · v${result.publication.version}` : ''}`
+            ? (result.publication ? `已批准并发布 ${item.skillId} · v${result.publication.version}` : `已记录批准，但发布未生效 ${item.skillId}；可在「已处置」重试。`)
             : `已拒绝 ${item.skillId}`)
+          await load()
+        } catch (failure) { setError(failure.message) }
+        finally { setBusy('') }
+      }
+      async function rollback(item) {
+        if (busy) return
+        setBusy(item.skillId); setError(''); setMessage(''); setRollbackOf('')
+        try {
+          const result = await harnessRequest('/rollback', { skillId: item.skillId, confirm: true })
+          setMessage(`已生成回滚候选（目标 v${result.previous?.version ?? '?'}）：批准后才会生效。`)
           await load()
         } catch (failure) { setError(failure.message) }
         finally { setBusy('') }
@@ -808,27 +840,53 @@ window.__ModuleLoader__.load({
       const pendingCard = error
         ? h(Card, { title: '待批技能候选', actions: button('重试', () => { void load() }, { kind: 'quiet' }) }, h('p', { className: 'evo-hint', role: 'alert' }, error))
         : h(Card, { title: items === null ? '待批技能候选' : `待批技能候选（${items.length}）` },
-          h('p', { className: 'evo-hint' }, '技能正文会作为模型可见的说明书生效，发布后立即对所有会话可见。请先读完正文，再决定批准或拒绝。人格提案不在这里，见「人格 → 提案」。'),
+          h('p', { className: 'evo-hint' }, '技能正文会作为模型可见的说明书生效，发布后立即对所有会话可见。下面是逐行差异与附件全文：读完再批准。人格提案不在这里，见「人格 → 提案」。'),
           items === null ? h('p', { className: 'evo-hint' }, '正在读取技能候选…')
             : items.length === 0 ? h(Empty, null, '暂无待批技能候选。AutoDream 产出的技能候选会出现在这里，确认前不会发布。')
-            : h('div', { className: 'evo-list' }, items.map(item => h('div', { key: item.candidateId, className: 'evo-rec' },
-              h('div', { className: 'evo-row between' },
-                h('strong', null, item.skillId),
-                h('span', { className: 'evo-meta' }, fmtTime(item.stagedAt))),
-              h('p', { className: 'evo-mono' }, `候选 ${shortId(item.candidateId, 16)} · 摘要 ${shortId(item.bundleDigest, 12)} · 基线 ${item.baselineDigest ? shortId(item.baselineDigest, 12) : '新建'}`),
-              item.description ? h('p', null, item.description) : null,
-              item.files?.length ? h('p', { className: 'evo-hint' }, `附件：${item.files.join('、')}`) : null,
-              h('pre', { className: 'evo-pre' }, item.content),
-              h('div', { className: 'evo-row' },
-                button(busy === item.candidateId ? '处理中…' : '批准并发布', () => { void decide(item, 'approved') }, { disabled: Boolean(busy), kind: 'primary' }),
-                button('拒绝', () => { void decide(item, 'rejected') }, { disabled: Boolean(busy) }))))))
+            : h('div', { className: 'evo-list' }, items.map(item => {
+              const review = item.truncated ? [] : diffBundles(item.bundle, item.baselineBundle)
+              const attachments = (item.bundle ?? []).filter(file => file.name !== 'SKILL.md')
+              const evidence = (item.evidenceRefs ?? []).map(ref => ref.eventId || ref.id || ref.sessionId || JSON.stringify(ref)).join('、')
+              return h('div', { key: item.candidateId, className: 'evo-rec' },
+                h('div', { className: 'evo-row between' },
+                  h('strong', null, item.skillId),
+                  h('span', { className: 'evo-meta' }, fmtTime(item.stagedAt))),
+                h('p', { className: 'evo-mono' }, `候选 ${shortId(item.candidateId, 16)} · 摘要 ${shortId(item.bundleDigest, 12)} · 基线 ${item.baselineDigest ? shortId(item.baselineDigest, 12) : '新建'}`),
+                h('p', { className: 'evo-mono' }, `工单 ${item.ticketId} · 主体 ${item.subjectId}${evidence ? ` · 证据 ${evidence}` : ''}`),
+                item.description ? h('p', null, item.description) : null,
+                item.truncated ? h('p', { className: 'evo-hint' }, '内容较大，本次省略了部分正文；缩小改动后重新生成再审阅。') : null,
+                !item.truncated && review.length === 0 ? h('p', { className: 'evo-hint' }, '与当前版本没有可显示的差异。') : null,
+                review.map(file => h('details', { key: file.name, open: file.name === 'SKILL.md' },
+                  h('summary', null, `${file.name}（${file.lines.filter(line => line.kind === 'add').length} 增 / ${file.lines.filter(line => line.kind === 'remove').length} 删${file.omitted ? ` · 省略 ${file.omitted} 行` : ''}）`),
+                  h('pre', { className: 'evo-pre' }, file.lines.map(line => `${line.kind === 'add' ? '+' : '-'} ${line.text}`).join('\n')))),
+                attachments.length ? h('details', null, h('summary', null, `附件全文（${attachments.length}）`),
+                  attachments.map(file => h('div', { key: file.name }, h('h4', null, file.name), h('pre', { className: 'evo-pre' }, file.content)))) : null,
+                h('div', { className: 'evo-row' },
+                  button(busy === item.candidateId ? '处理中…' : '批准并发布', () => { void decide(item, 'approved') }, { disabled: Boolean(busy), kind: 'primary' }),
+                  button('拒绝', () => { void decide(item, 'rejected') }, { disabled: Boolean(busy) })))
+            })))
+      const decidedCard = decided.length ? h(Card, { title: `已处置（${decided.length}）` },
+        h('p', { className: 'evo-hint' }, '已批准但没有发布版本的候选会留在这里，可再次批准重试；拒绝的候选不会重新出现。'),
+        h('div', { className: 'evo-list' }, decided.map(item => h('div', { key: item.candidateId, className: 'evo-rec' },
+          h('div', { className: 'evo-row between' },
+            h('strong', null, item.skillId),
+            h('span', { className: 'evo-chip' }, item.decision === 'approved' ? (item.publication ? `v${item.publication.version}` : '未发布') : '已拒绝')),
+          h('p', { className: 'evo-mono' }, `候选 ${shortId(item.candidateId, 16)} · 工单 ${item.ticketId} · ${fmtTime(item.decidedAt)}`),
+          item.decision === 'approved' && !item.publication ? h('div', { className: 'evo-row' },
+            button(busy === item.candidateId ? '重试中…' : '重试发布', () => { void decide(item, 'approved') }, { disabled: Boolean(busy), kind: 'primary' })) : null)))) : null
       const liveCard = live.length ? h(Card, { title: '已发布的 harness 技能' },
         h('div', { className: 'evo-list' }, live.map(item => h('div', { key: item.skillId, className: 'evo-rec' },
           h('div', { className: 'evo-row between' }, h('strong', null, item.skillId), h('span', { className: 'evo-chip' }, `v${item.version}`)),
-          h('p', { className: 'evo-mono' }, `摘要 ${shortId(item.bundleDigest, 12)} · 决定 ${shortId(item.decisionDigest, 12)}`))))) : null
+          h('p', { className: 'evo-mono' }, `摘要 ${shortId(item.bundleDigest, 12)}`),
+          h('div', { className: 'evo-row' },
+            rollbackOf === item.skillId
+              ? [h('span', { key: 'hint', className: 'evo-hint' }, `回滚会生成一个回到 v${item.version - 1} 的待批候选，批准后才生效。`),
+                button(busy === item.skillId ? '生成中…' : '确认生成回滚候选', () => { void rollback(item) }, { disabled: Boolean(busy), kind: 'primary' }),
+                button('取消', () => setRollbackOf(''), { disabled: Boolean(busy) })]
+              : button('回滚到上一版', () => setRollbackOf(item.skillId), { disabled: Boolean(busy) || item.version <= 1 })))))) : null
       return h(React.Fragment, null,
         message ? h('p', { className: 'evo-hint', role: 'status' }, message) : null,
-        pendingCard, liveCard)
+        pendingCard, decidedCard, liveCard)
     }
 
     function DreamTab({ refreshKey, settingsOnly = false }) {

@@ -145,6 +145,23 @@ test('owner staging holds candidate bodies; completion leaves the candidate for 
   await assert.rejects(f.service.authorize({ ...body, subjectId, scope: 'skill:stage', skillId: 'test-skill', entryDigest: hash(plan.candidates[0].entry) }), /settled|absent/)
 })
 
+test('staging binds the request id through the owner and sends the baseline as a POST body', async t => {
+  const calls = []
+  const f = await fixture(t, { owner: async (name, path, body) => {
+    calls.push({ name, path, body })
+    if (path === '/candidates') return { candidateId: 'c1', skillId: 'test-skill', bundleDigest: 'bundle', baselineDigest: null }
+    if (path === '/baseline') return { revision: 2, digest: 'persona-digest' }
+    return []
+  } })
+  const { request } = await planned(f, [{ kind: 'skill', skillId: 'test-skill', expectedDigest: null, entry: { content: 'instructions' } }])
+  // A Ticket may own several Dream Inputs; the owner must authorize this one, not the first.
+  assert.equal(calls.find(call => call.path === '/candidates').body.requestId, request.id)
+  const baseline = await f.service.baseline({ ticketId: 'ticket-1', requestId: request.id })
+  assert.deepEqual(baseline.persona, { revision: 2, digest: 'persona-digest' })
+  // An empty object body keeps the Laputa call a POST; no body would be sent as GET.
+  assert.deepEqual(calls.find(call => call.name === 'laputa' && call.path === '/baseline').body, {})
+})
+
 test('a skill publication recorded by the owner panel shows up on the run without touching the journal', async t => {
   const f = await fixture(t, { owner: async (name, path, body) => {
     if (path === '/candidates') return { candidateId: 'c1', skillId: 'test-skill', bundleDigest: 'bundle', baselineDigest: null }

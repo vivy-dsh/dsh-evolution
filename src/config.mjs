@@ -7,7 +7,6 @@ import { HARNESS_ENTRY_ID, EvolutionError, jsonClone } from './harness.mjs'
  * paths this plugin will ever place in the profile patch.
  */
 export const CONFIG_FIELDS = [
-  { path: ['requireGlobalApproval'], label: '全局变更需人工确认', group: '自动进化', type: 'switch' },
   { path: ['defaultGlobal'], label: '默认写入全局', group: '注入与治理', type: 'switch', hint: '调用未指定 global 时使用的 store' },
   { path: ['maxInjectedEntriesPerKind'], label: '每类注入上限', group: '注入与治理', type: 'number', min: 1, step: 1 },
   {
